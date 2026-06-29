@@ -7,6 +7,7 @@ Azure Pricing Calculator → Cost Estimation Workbook
   to exactly equal the Calculator's total row, preventing any cost inflation.
 • Standalone License Bypassing: Detects detached RHEL/SUSE/SQL rows and 
   prints them cleanly as single items.
+• Safe parsing for missing service types and missing files.
 
 Usage:
     python convert.py input.xlsx [output.xlsx]
@@ -296,7 +297,8 @@ def parse_format_b(wb):
 def classify(rows):
     buckets = {}
     for r in rows:
-        key = r["svc_type"].lower().strip()
+        # Safely convert to lower case even if the cell is blank/None
+        key = str(r.get("svc_type") or "").lower().strip()
         sheet = SVC_MAP.get(key)
         if not sheet:
             for k,v in SVC_MAP.items():
@@ -590,15 +592,46 @@ if __name__ == "__main__":
         print('\n  Usage:   python convert.py "input file.xlsx"\n'); sys.exit(1)
 
     full = " ".join(args)
-    xlsx_positions = [i + 5 for i in range(len(full)) if full.lower().startswith(".xlsx", i)]
-    if not xlsx_positions: sys.exit(1)
+    
+    # Safely find all ".xlsx" occurrences
+    lower_full = full.lower()
+    xlsx_positions = []
+    pos = 0
+    while True:
+        idx = lower_full.find(".xlsx", pos)
+        if idx == -1: break
+        xlsx_positions.append(idx + 5)
+        pos = idx + 1
+        
+    if not xlsx_positions:
+        print(f'\n  ERROR: No .xlsx file found in: {full}\n')
+        sys.exit(1)
 
     inp = full[:xlsx_positions[0]].strip()
-    currency = full[xlsx_positions[-1]:].strip().split()[0].upper() if full[xlsx_positions[-1]:].strip() and full[xlsx_positions[-1]:].strip().split()[0].isalpha() else "INR"
+    
+    # Try to grab the currency code if provided at the end
+    remainder = full[xlsx_positions[-1]:].strip()
+    if remainder and len(remainder.split()[0]) == 3 and remainder.split()[0].isalpha():
+        currency = remainder.split()[0].upper()
+    else:
+        currency = "INR"
+        
     out = full[xlsx_positions[0]:xlsx_positions[1]].strip() if len(xlsx_positions) >= 2 else None
 
     inp_path = Path(inp)
-    if not inp_path.exists(): sys.exit(1)
+    
+    # Verbose Error Printing if file is missing
+    if not inp_path.exists():
+        print(f'\n  ERROR: File not found -> {inp}\n')
+        print(f'  Please make sure you are running the script in the same folder')
+        print(f'  as your Excel file, or provide the full path to the file.\n')
+        print(f'  Current folder: {Path.cwd()}')
+        print(f'  Available .xlsx files here:')
+        for f in sorted(Path.cwd().glob("*.xlsx")):
+            print(f'    {f.name}')
+        print('\n')
+        sys.exit(1)
+        
     if out is None: out = str(inp_path.resolve().parent / "Cost_Estimation.xlsx")
     
     Path(out).parent.mkdir(parents=True, exist_ok=True)
