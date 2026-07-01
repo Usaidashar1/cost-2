@@ -102,12 +102,8 @@ def _hourly_to_monthly(price): return price * 730
 
 def detect_os(desc):
     desc_l = desc.lower()
-    if "hybrid benefit" in desc_l: return "Linux" 
-    if "red hat" in desc_l or "rhel" in desc_l: return "Red Hat"
-    if "suse" in desc_l or "sles" in desc_l: return "SUSE"
-    if "linux" in desc_l or "ubuntu" in desc_l or "centos" in desc_l: return "Linux"
     if "windows" in desc_l: return "Windows"
-    return "Windows" 
+    return "Linux" 
 
 def detect_sql_license(desc):
     desc_l = desc.lower()
@@ -118,15 +114,20 @@ def detect_sql_license(desc):
     if "sql" in desc_l: return "SQL License"
     return None
 
-def get_exact_license_name(desc, os_type):
+def get_exact_license_name(desc):
     parts = re.split(r'[,;]', desc)
     sql_name = os_name = None
+    prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
     for p in parts:
         p_lower = p.lower()
         if "sql" in p_lower:
-            sql_name = re.sub(r'\s*\([^)]*\)', '', p).strip() 
-        if os_type in ["Red Hat", "SUSE"] and ("red hat" in p_lower or "rhel" in p_lower or "suse" in p_lower or "sles" in p_lower):
+            sql_name = re.sub(r'\s*\([^)]*\)', '', p).strip()
+        
+        # Exact extraction for diverse Linux licenses (SAP, HA, etc.)
+        if any(kw in p_lower for kw in prem_kws) and "sql" not in p_lower:
             os_name = re.sub(r'\s*\([^)]*\)', '', p).strip()
+            if os_name.lower().startswith("linux "):
+                os_name = os_name[6:].strip()
     return sql_name, os_name
 
 def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR"):
@@ -145,22 +146,12 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
             items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Consumption")
             return items or []
 
-        def get_ri(s):
-            items = fetch(s, "Reservation")
-            if items: return items
-            items = fetch(s.replace("s_v", "_v").replace("s_V", "_V"), "Reservation")
-            if items: return items
-            items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Reservation")
-            return items or []
-
         payg_items = get_payg(sku)
-        ri_items = get_ri(sku)
         
         if not payg_items:
             base_sku = re.sub(r'-\d+', '', sku)
             if base_sku != sku:
                 payg_items = get_payg(base_sku)
-                ri_items = get_ri(base_sku)
 
         def _get_price(items, must_be_win=False):
             cands = []
@@ -189,17 +180,6 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
         result["compute_payg"] = api_comp
         if api_win_tot and api_comp:
             result["windows_license"] = max(0, api_win_tot - api_comp)
-
-        if not is_spot:
-            ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
-            ri1_val = _get_price(ri1_cands, must_be_win=False)
-            if ri1_val is not None:
-                result["compute_ri1"] = ri1_val / 12 
-
-            ri3_cands = [i for i in ri_items if i.get("reservationTerm") == "3 Years"]
-            ri3_val = _get_price(ri3_cands, must_be_win=False)
-            if ri3_val is not None:
-                result["compute_ri3"] = ri3_val / 36
 
     except Exception as e:
         log.warning(f"VM pricing error for {sku}: {e}")
@@ -235,11 +215,6 @@ def extract_quantity(desc):
         except ValueError:
             return 1
     return 1
-
-def extract_vcpus(desc):
-    if not desc: return None
-    m = re.search(r'\((\d+)\s*vCPU', desc, re.IGNORECASE)
-    return int(m.group(1)) if m else None
 
 # ── Parsing ────────────────────────────────────────────────────────────────
 def parse_format(wb):
@@ -297,98 +272,100 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
     session = get_http_session()
     cache = {}
     
+    # --- PHASE 1: GLOBAL FX ENGINE ---
+    # Find the exact exchange rate the Azure Calculator used by locating one pure VM.
+    locked_fx = 1.0
+    if currency != "USD":
+        for row in vm_rows:
+            desc = row["desc"]
+            sku = extract_vm_sku(desc)
+            sql_lbl, _ = get_exact_license_name(desc)
+            prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
+            has_prem = any(kw in desc.lower() for kw in prem_kws)
+            
+            # If it's a standard Free Linux or pure Windows VM, it's perfect for FX extraction
+            if sku and not has_prem and not sql_lbl:
+                qty = extract_quantity(desc)
+                p_usd = get_vm_pricing(session, cache, sku, row["region"], "spot" in desc.lower(), "USD")
+                usd_comp = (p_usd.get("compute_payg") or 0) * qty
+                usd_win = (p_usd.get("windows_license") or 0) * qty if detect_os(desc) == "Windows" else 0
+                usd_tot = usd_comp + usd_win
+                orig_payg = row.get("payg", 0)
+                
+                if usd_tot > 0 and orig_payg > 0:
+                    locked_fx = orig_payg / usd_tot
+                    break
+        
+        # API live fallback if absolutely no clean VMs exist in the export
+        if locked_fx == 1.0:
+            for row in vm_rows:
+                sku = extract_vm_sku(row["desc"])
+                if sku:
+                    p_usd = get_vm_pricing(session, cache, sku, row["region"], "spot" in row["desc"].lower(), "USD")
+                    p_tgt = get_vm_pricing(session, cache, sku, row["region"], "spot" in row["desc"].lower(), currency)
+                    if p_usd.get("compute_payg") and p_tgt.get("compute_payg"):
+                        locked_fx = p_tgt["compute_payg"] / p_usd["compute_payg"]
+                        break
+                        
+    log.info(f"Detected Locked Exchange Rate: {locked_fx:.4f}")
+
+    # --- PHASE 2: PROCESSING ---
     def process_row(row):
         desc, region = row["desc"], row["region"]
-        os_type, sql_lbl = detect_os(desc), detect_sql_license(desc)
+        os_type = detect_os(desc)
         qty = extract_quantity(desc)
         sku = extract_vm_sku(desc)
 
-        sql_exact, os_exact = get_exact_license_name(desc, os_type)
+        sql_exact, os_exact = get_exact_license_name(desc)
+        prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
+        has_premium_os = any(kw in desc.lower() for kw in prem_kws)
+        has_sql = bool(sql_exact)
+
         row["sql_lbl_exact"] = sql_exact or "SQL License"
-        row["os_lbl_exact"]  = os_exact or f"{os_type} License"
+        row["os_lbl_exact"]  = os_exact or f"Premium OS License"
         row["api"] = {}
 
         if not sku:
-            is_standalone = False
-            if os_type in ["Red Hat", "SUSE"] or sql_lbl: is_standalone = True
-            if is_standalone: row["api"] = {"is_standalone": True}
+            if has_premium_os or has_sql: row["api"] = {"is_standalone": True}
             return row
 
         is_spot = "spot" in desc.lower()
-        
-        # We fetch USD to act as our absolute source of truth for pricing ratios and RI costs
         p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
+        
         usd_comp = (p_usd.get("compute_payg") or 0) * qty
         usd_win  = (p_usd.get("windows_license") or 0) * qty
-        usd_ri1  = (p_usd.get("compute_ri1") or 0) * qty
-        usd_ri3  = (p_usd.get("compute_ri3") or 0) * qty
         
         orig_payg = row.get("payg", 0)
         orig_ri1  = row.get("ri1", orig_payg)
         orig_ri3  = row.get("ri3", orig_payg)
 
-        # Failsafe if API returns absolutely nothing
         if usd_comp == 0:
             row["api"] = {
-                "compute_payg_final": orig_payg,
-                "win_lic_payg_final": 0,
-                "prem_os_payg_final": 0,
-                "sql_payg_final": 0,
-                "compute_ri1": orig_ri1,
-                "compute_ri3": orig_ri3
+                "compute_payg_final": orig_payg, "win_lic_payg_final": 0,
+                "prem_os_payg_final": 0, "sql_payg_final": 0,
+                "compute_ri1": orig_ri1, "compute_ri3": orig_ri3
             }
             return row
 
-        # Fetch Target Currency for accurate native PAYG fallback comparison
-        p_tgt = get_vm_pricing(session, cache, sku, region, is_spot, currency)
-        tgt_comp = (p_tgt.get("compute_payg") or 0) * qty
-        
-        has_premium_os = os_type in ["Red Hat", "SUSE"] or (os_type == "Linux" and orig_payg > (tgt_comp * 1.05) and not sql_exact)
-        has_sql = bool(sql_exact)
-
-        calc_fx = (tgt_comp / usd_comp) if usd_comp > 0 else 1.0
-
-        compute_payg = orig_payg
-        win_lic_payg = 0
+        # Apply flawless global FX
+        compute_payg = usd_comp * locked_fx
+        win_lic_payg = usd_win * locked_fx if os_type == "Windows" else 0
         prem_os_payg = 0
         sql_payg = 0
 
-        # --- DEDUCE PAYG COMPONENTS ---
-        if not has_sql and not has_premium_os:
-            usd_total = usd_comp + (usd_win if os_type == "Windows" else 0)
-            if usd_total > 0 and orig_payg > 0:
-                calc_fx = orig_payg / usd_total
-                
-            compute_payg = usd_comp * calc_fx
-            if os_type == "Windows":
-                win_lic_payg = usd_win * calc_fx
-
-        elif has_premium_os:
-            vcpus = extract_vcpus(desc)
-            os_candidates = [42.05, 29.20] if (vcpus and vcpus <= 4) else [94.90, 73.00]
-            if not vcpus: os_candidates = [42.05, 94.90, 29.20, 73.00]
-            
-            best_os = 42.05
-            min_diff = float('inf')
-            for os_usd in os_candidates:
-                test_fx = orig_payg / (usd_comp + (os_usd * qty))
-                diff = abs(test_fx - calc_fx)
-                if diff < min_diff:
-                    min_diff = diff
-                    best_os = os_usd
-            
-            calc_fx = orig_payg / (usd_comp + (best_os * qty))
-            
-            compute_payg = usd_comp * calc_fx
-            prem_os_payg = (best_os * qty) * calc_fx
-            row["os_lbl_exact"] = row.get("os_lbl_exact") if os_type != "Linux" else "Premium OS License"
-
-        else:
-            compute_payg = usd_comp * calc_fx
-            if os_type == "Windows":
-                win_lic_payg = usd_win * calc_fx
-            unaccounted = orig_payg - compute_payg - win_lic_payg
-            sql_payg = max(0, unaccounted)
+        unaccounted = orig_payg - compute_payg - win_lic_payg
+        
+        # Absolute text-based OS splitting (Eliminates B-Series false positives)
+        if unaccounted > 5:
+            if has_premium_os and has_sql:
+                sql_payg = unaccounted 
+            elif has_premium_os:
+                prem_os_payg = unaccounted
+            elif has_sql:
+                sql_payg = unaccounted
+            else:
+                # If it's standard free Linux (e.g. B16ms), the extra cost is safely pushed back into compute.
+                compute_payg += unaccounted
 
         p = {}
         p["compute_payg_final"] = compute_payg
@@ -396,18 +373,10 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
         p["sql_payg_final"]     = sql_payg
         p["prem_os_payg_final"] = prem_os_payg
         
-        # --- THE PROPORTIONAL RI FIX ---
-        # We multiply the stable USD RI value by our precisely deduced Excel exchange rate (calc_fx)
-        # This absolutely guarantees the RI cost aligns perfectly with the Azure Calculator UI.
-        if usd_ri1 > 0:
-            p["compute_ri1"] = usd_ri1 * calc_fx
-        else:
-            p["compute_ri1"] = max(0, orig_ri1 - (win_lic_payg + prem_os_payg + sql_payg))
-            
-        if usd_ri3 > 0:
-            p["compute_ri3"] = usd_ri3 * calc_fx
-        else:
-            p["compute_ri3"] = max(0, orig_ri3 - (win_lic_payg + prem_os_payg + sql_payg))
+        # Final RI Subtraction
+        license_total = win_lic_payg + prem_os_payg + sql_payg
+        p["compute_ri1"] = max(0, orig_ri1 - license_total)
+        p["compute_ri3"] = max(0, orig_ri3 - license_total)
         
         row["api"] = p
         return row
