@@ -131,7 +131,7 @@ def get_exact_license_name(desc, os_type):
 
 def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR"):
     region = arm_region(region_display)
-    result = {"compute_payg": None, "windows_license": None}
+    result = {"compute_payg": None, "windows_license": None, "compute_ri1": None, "compute_ri3": None}
 
     try:
         def fetch(s, ptype): 
@@ -145,11 +145,22 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
             items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Consumption")
             return items or []
 
+        def get_ri(s):
+            items = fetch(s, "Reservation")
+            if items: return items
+            items = fetch(s.replace("s_v", "_v").replace("s_V", "_V"), "Reservation")
+            if items: return items
+            items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Reservation")
+            return items or []
+
         payg_items = get_payg(sku)
+        ri_items = get_ri(sku)
+        
         if not payg_items:
             base_sku = re.sub(r'-\d+', '', sku)
             if base_sku != sku:
                 payg_items = get_payg(base_sku)
+                ri_items = get_ri(base_sku)
 
         def _get_price(items, must_be_win=False):
             cands = []
@@ -178,6 +189,18 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
         result["compute_payg"] = api_comp
         if api_win_tot and api_comp:
             result["windows_license"] = max(0, api_win_tot - api_comp)
+
+        # Re-enabled API RI Fetching
+        if not is_spot:
+            ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
+            ri1_val = _get_price(ri1_cands, must_be_win=False)
+            if ri1_val is not None:
+                result["compute_ri1"] = ri1_val / 12 
+
+            ri3_cands = [i for i in ri_items if i.get("reservationTerm") == "3 Years"]
+            ri3_val = _get_price(ri3_cands, must_be_win=False)
+            if ri3_val is not None:
+                result["compute_ri3"] = ri3_val / 36
 
     except Exception as e:
         log.warning(f"VM pricing error for {sku}: {e}")
@@ -315,9 +338,11 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             }
             return row
 
-        # Fetch Target Currency just to get the API's Live FX rate for safe fallbacks
+        # Fetch Target Currency for accurate native RI costs
         p_tgt = get_vm_pricing(session, cache, sku, region, is_spot, currency)
         tgt_comp = (p_tgt.get("compute_payg") or 0) * qty
+        tgt_ri1  = (p_tgt.get("compute_ri1") or 0) * qty
+        tgt_ri3  = (p_tgt.get("compute_ri3") or 0) * qty
         
         # Currency-agnostic check for hidden Premium OS
         has_premium_os = os_type in ["Red Hat", "SUSE"] or (os_type == "Linux" and orig_payg > (tgt_comp * 1.05) and not sql_exact)
@@ -371,20 +396,24 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             unaccounted = orig_payg - compute_payg - win_lic_payg
             sql_payg = max(0, unaccounted)
 
-        # Build final drift-free output dictionary
+        # Build final output dictionary
         p = {}
         p["compute_payg_final"] = compute_payg
         p["win_lic_payg_final"] = win_lic_payg
         p["sql_payg_final"]     = sql_payg
         p["prem_os_payg_final"] = prem_os_payg
         
-        # --- THE ULTIMATE RI FIX ---
-        # Instead of trusting the API's amortization math for RIs, we trust the user's Excel file.
-        # We subtract our perfectly deduced License Costs from the Excel's Total RI Cost.
-        license_total = win_lic_payg + prem_os_payg + sql_payg
-        
-        p["compute_ri1"] = max(0, orig_ri1 - license_total)
-        p["compute_ri3"] = max(0, orig_ri3 - license_total)
+        # --- HYBRID RI FIX ---
+        # We fetch the exact, natively converted target currency RI cost from Azure API.
+        if tgt_ri1 > 0:
+            p["compute_ri1"] = tgt_ri1
+        else:
+            p["compute_ri1"] = max(0, orig_ri1 - (win_lic_payg + prem_os_payg + sql_payg))
+            
+        if tgt_ri3 > 0:
+            p["compute_ri3"] = tgt_ri3
+        else:
+            p["compute_ri3"] = max(0, orig_ri3 - (win_lic_payg + prem_os_payg + sql_payg))
         
         row["api"] = p
         return row
