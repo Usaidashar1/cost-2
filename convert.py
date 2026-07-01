@@ -193,15 +193,17 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
 
 def extract_vm_sku(desc):
     if not desc: return None
+    # Extracts the SKU name inside the parentheses, e.g., "1 E16-4as v5 ("
     m = re.match(r'^\s*[\d,]+\s+([^()]+)\(', desc)
     if m:
         raw = m.group(1).strip()
-        norm = re.sub(r'[\s\-]+', '_', raw)
+        # We replace spaces with underscores, but PRESERVE hyphens for constrained vCPUs (e.g., E16-4as_v5)
+        norm = re.sub(r'\s+', '_', raw)
         if not norm.lower().startswith("standard_"):
             norm = "Standard_" + norm
         return norm
         
-    patterns = [r'^\d+\s+((?:[A-Z][A-Za-z0-9]+\s+)+v\d+)', r'^\d+\s+([A-Z][A-Za-z0-9]+)\s*\(', r'(Standard_[A-Za-z0-9_]+)']
+    patterns = [r'^\d+\s+((?:[A-Z][A-Za-z0-9\-]+\s+)+v\d+)', r'^\d+\s+([A-Z][A-Za-z0-9\-]+)\s*\(', r'(Standard_[A-Za-z0-9_\-]+)']
     for pat in patterns:
         m = re.search(pat, desc.strip())
         if m:
@@ -227,6 +229,13 @@ def parse_format(wb):
     rows = []
     in_data = valid_format = False
     
+    def _get_cost(row_data, idx, fallback):
+        # If the cell exists, is a number, and is strictly greater than 0, use it.
+        # Otherwise (if it's 0, None, or a string), inherit the PAYG cost.
+        if len(row_data) > idx and isinstance(row_data[idx], (int, float)) and row_data[idx] > 0:
+            return float(row_data[idx])
+        return float(fallback)
+
     for r in ws.iter_rows(values_only=True):
         if not r or r[0] is None: continue
         if str(r[0]).strip().lower() == "service category":
@@ -246,8 +255,9 @@ def parse_format(wb):
         rows.append({
             "svc_cat": svc_cat, "svc_type": svc_type, "cust_name": str(r[2] or "").strip(),
             "region": region, "desc": desc, "payg": float(cost_raw),
-            "ri1": r[6] if len(r)>6 and isinstance(r[6], (int,float)) else float(cost_raw), 
-            "ri3": r[7] if len(r)>7 and isinstance(r[7], (int,float)) else float(cost_raw), 
+            # Extract RI costs, forcing a fallback to PAYG if the Excel value is 0 or invalid
+            "ri1": _get_cost(r, 6, cost_raw), 
+            "ri3": _get_cost(r, 7, cost_raw), 
             "remarks": "", "sub_rows": []
         })
         
@@ -353,11 +363,15 @@ def write_vm_sheet(wb, rows):
         p = row.get("api", {})
         if p.get("is_standalone"):
             payg = row.get("payg", 0)
+            # RIs handled by _get_cost fallback in parse_format
+            ri1 = row.get("ri1", payg)
+            ri3 = row.get("ri3", payg)
+            
             vals = [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"],
-                    round(payg,2), round(payg,2), round(payg,2), row.get("remarks","")]
+                    round(payg,2), round(ri1,2), round(ri3,2), row.get("remarks","")]
             for ci, v in enumerate(vals, 1): dat(ws.cell(ri, ci), v, align="right" if ci>=6 and isinstance(v,float) else "left")
             ri += 1
-            total_payg += payg; total_ri1 += payg; total_ri3 += payg
+            total_payg += payg; total_ri1 += ri1; total_ri3 += ri3
             continue
 
         compute_payg = p.get("compute_payg_final", row.get("payg",0))
