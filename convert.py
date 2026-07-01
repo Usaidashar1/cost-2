@@ -131,7 +131,7 @@ def get_exact_license_name(desc, os_type):
 
 def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR"):
     region = arm_region(region_display)
-    result = {"compute_payg": None, "windows_license": None, "compute_ri1": None, "compute_ri3": None}
+    result = {"compute_payg": None, "windows_license": None}
 
     try:
         def fetch(s, ptype): 
@@ -145,22 +145,11 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
             items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Consumption")
             return items or []
 
-        def get_ri(s):
-            items = fetch(s, "Reservation")
-            if items: return items
-            items = fetch(s.replace("s_v", "_v").replace("s_V", "_V"), "Reservation")
-            if items: return items
-            items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Reservation")
-            return items or []
-
         payg_items = get_payg(sku)
-        ri_items = get_ri(sku)
-        
         if not payg_items:
             base_sku = re.sub(r'-\d+', '', sku)
             if base_sku != sku:
                 payg_items = get_payg(base_sku)
-                ri_items = get_ri(base_sku)
 
         def _get_price(items, must_be_win=False):
             cands = []
@@ -189,17 +178,6 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
         result["compute_payg"] = api_comp
         if api_win_tot and api_comp:
             result["windows_license"] = max(0, api_win_tot - api_comp)
-
-        if not is_spot:
-            ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
-            ri1_val = _get_price(ri1_cands, must_be_win=False)
-            if ri1_val is not None:
-                result["compute_ri1"] = ri1_val / 12 
-
-            ri3_cands = [i for i in ri_items if i.get("reservationTerm") == "3 Years"]
-            ri3_val = _get_price(ri3_cands, must_be_win=False)
-            if ri3_val is not None:
-                result["compute_ri3"] = ri3_val / 36
 
     except Exception as e:
         log.warning(f"VM pricing error for {sku}: {e}")
@@ -315,91 +293,98 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             return row
 
         is_spot = "spot" in desc.lower()
-        p = get_vm_pricing(session, cache, sku, region, is_spot, currency)
         
-        api_comp = (p.get("compute_payg") or 0) * qty
-        api_win  = (p.get("windows_license") or 0) * qty
-        orig_payg = row.get("payg", 0)
-        
-        # Ensure we always fetch USD prices to bypass API live FX drift
+        # We fetch USD to act as our absolute source of truth for pricing ratios
         p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
         usd_comp = (p_usd.get("compute_payg") or 0) * qty
         usd_win  = (p_usd.get("windows_license") or 0) * qty
         
-        has_premium_os = os_type in ["Red Hat", "SUSE"] or (os_type == "Linux" and orig_payg > (usd_comp * 80) and not sql_exact)
+        orig_payg = row.get("payg", 0)
+        orig_ri1  = row.get("ri1", orig_payg)
+        orig_ri3  = row.get("ri3", orig_payg)
+
+        # Failsafe if API returns absolutely nothing
+        if usd_comp == 0:
+            row["api"] = {
+                "compute_payg_final": orig_payg,
+                "win_lic_payg_final": 0,
+                "prem_os_payg_final": 0,
+                "sql_payg_final": 0,
+                "compute_ri1": orig_ri1,
+                "compute_ri3": orig_ri3
+            }
+            return row
+
+        # Fetch Target Currency just to get the API's Live FX rate for safe fallbacks
+        p_tgt = get_vm_pricing(session, cache, sku, region, is_spot, currency)
+        tgt_comp = (p_tgt.get("compute_payg") or 0) * qty
+        
+        # Currency-agnostic check for hidden Premium OS
+        has_premium_os = os_type in ["Red Hat", "SUSE"] or (os_type == "Linux" and orig_payg > (tgt_comp * 1.05) and not sql_exact)
         has_sql = bool(sql_exact)
+
+        # Default fallback to Live Exchange Rate
+        calc_fx = (tgt_comp / usd_comp) if usd_comp > 0 else 1.0
 
         compute_payg = orig_payg
         win_lic_payg = 0
         prem_os_payg = 0
         sql_payg = 0
 
-        # --- THE SURGICAL FIX (ITERATION 8) ---
+        # --- DEDUCE PAYG COMPONENTS ---
         if not has_sql and not has_premium_os:
-            # PURE VM: Proportional Split to perfectly align with Azure Calculator UI
+            # PURE VM: Reverse engineer exact locked Excel exchange rate
             usd_total = usd_comp + (usd_win if os_type == "Windows" else 0)
             if usd_total > 0 and orig_payg > 0:
                 calc_fx = orig_payg / usd_total
-                compute_payg = usd_comp * calc_fx
-                if os_type == "Windows":
-                    win_lic_payg = usd_win * calc_fx
-            else:
-                # Safe Fallback
-                compute_payg = api_comp if api_comp > 0 else orig_payg
-                unaccounted = orig_payg - compute_payg
-                if os_type == "Windows":
-                    win_lic_payg = min(max(0, unaccounted), api_win)
-        else:
-            # COMPLEX VM: Absolute deduction 
-            compute_payg = api_comp if api_comp > 0 else orig_payg
-            unaccounted = orig_payg - compute_payg
+                
+            compute_payg = usd_comp * calc_fx
+            if os_type == "Windows":
+                win_lic_payg = usd_win * calc_fx
+
+        elif has_premium_os:
+            # PREMIUM OS VM: Safely deduce locked exchange rate
+            vcpus = extract_vcpus(desc)
+            os_candidates = [42.05, 29.20] if (vcpus and vcpus <= 4) else [94.90, 73.00]
+            if not vcpus: os_candidates = [42.05, 94.90, 29.20, 73.00]
             
-            if os_type == "Windows" and api_win > 0:
-                win_lic_payg = min(max(0, unaccounted), api_win)
-                unaccounted -= win_lic_payg
-                
-            if unaccounted > 5:
-                if has_premium_os:
-                    vcpus = extract_vcpus(desc)
-                    os_candidates = [42.05, 29.20] if (vcpus and vcpus <= 4) else [94.90, 73.00]
-                    if not vcpus: os_candidates = [42.05, 94.90, 29.20, 73.00]
-                    
-                    if usd_comp > 0:
-                        api_fx = compute_payg / usd_comp if compute_payg else 1.0
-                        best_os = 42.05
-                        min_diff = float('inf')
-                        
-                        for os_usd in os_candidates:
-                            calc_fx = orig_payg / (usd_comp + (os_usd * qty))
-                            diff = abs(calc_fx - api_fx)
-                            if diff < min_diff:
-                                min_diff = diff
-                                best_os = os_usd
-                                
-                        calc_fx = orig_payg / (usd_comp + (best_os * qty))
-                        exact_os_cost = (best_os * qty) * calc_fx
-                        
-                        prem_os_payg = min(unaccounted, exact_os_cost)
-                    else:
-                        prem_os_payg = unaccounted
-                    
-                    row["os_lbl_exact"] = row.get("os_lbl_exact") if os_type != "Linux" else "Premium OS License"
-                    unaccounted -= prem_os_payg
-                    compute_payg += unaccounted
-                    unaccounted = 0
-                
-                elif sql_exact:
-                    sql_payg = unaccounted
-                    unaccounted = 0
-        # ------------------------
-                
+            best_os = 42.05
+            min_diff = float('inf')
+            for os_usd in os_candidates:
+                test_fx = orig_payg / (usd_comp + (os_usd * qty))
+                diff = abs(test_fx - calc_fx)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_os = os_usd
+            
+            calc_fx = orig_payg / (usd_comp + (best_os * qty))
+            
+            compute_payg = usd_comp * calc_fx
+            prem_os_payg = (best_os * qty) * calc_fx
+            row["os_lbl_exact"] = row.get("os_lbl_exact") if os_type != "Linux" else "Premium OS License"
+
+        else:
+            # SQL VM: Apply precise live FX to Compute, let drift flow into SQL License
+            compute_payg = usd_comp * calc_fx
+            if os_type == "Windows":
+                win_lic_payg = usd_win * calc_fx
+            unaccounted = orig_payg - compute_payg - win_lic_payg
+            sql_payg = max(0, unaccounted)
+
+        # Build final drift-free output dictionary
+        p = {}
         p["compute_payg_final"] = compute_payg
         p["win_lic_payg_final"] = win_lic_payg
         p["sql_payg_final"]     = sql_payg
         p["prem_os_payg_final"] = prem_os_payg
         
-        if p.get("compute_ri1"): p["compute_ri1"] *= qty
-        if p.get("compute_ri3"): p["compute_ri3"] *= qty
+        # --- THE ULTIMATE RI FIX ---
+        # Instead of trusting the API's amortization math for RIs, we trust the user's Excel file.
+        # We subtract our perfectly deduced License Costs from the Excel's Total RI Cost.
+        license_total = win_lic_payg + prem_os_payg + sql_payg
+        
+        p["compute_ri1"] = max(0, orig_ri1 - license_total)
+        p["compute_ri3"] = max(0, orig_ri3 - license_total)
         
         row["api"] = p
         return row
