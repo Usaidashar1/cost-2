@@ -134,31 +134,53 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
     result = {"compute_payg": None, "windows_license": None, "compute_ri1": None, "compute_ri3": None}
 
     try:
-        def fetch(s, ptype): return _api(session, cache, f"armSkuName eq '{s}' and armRegionName eq '{region}' and priceType eq '{ptype}'", currency)
+        def fetch(s, ptype): 
+            return _api(session, cache, f"armSkuName eq '{s}' and armRegionName eq '{region}' and priceType eq '{ptype}'", currency)
         
-        # Robust SKU Fallbacks
-        payg_items = fetch(sku, "Consumption")
-        if not payg_items: payg_items = fetch(sku.replace("s_v", "_v").replace("s_V", "_V"), "Consumption")
-        if not payg_items: payg_items = fetch(sku.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Consumption")
-        if not payg_items: payg_items = fetch(sku.replace("ds_v", "s_v").replace("ds_V", "s_V"), "Consumption")
+        def get_payg(s):
+            items = fetch(s, "Consumption")
+            if items: return items
+            items = fetch(s.replace("s_v", "_v").replace("s_V", "_V"), "Consumption")
+            if items: return items
+            items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Consumption")
+            return items or []
+
+        def get_ri(s):
+            items = fetch(s, "Reservation")
+            if items: return items
+            items = fetch(s.replace("s_v", "_v").replace("s_V", "_V"), "Reservation")
+            if items: return items
+            items = fetch(s.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Reservation")
+            return items or []
+
+        payg_items = get_payg(sku)
+        ri_items = get_ri(sku)
+        
+        # Azure Constrained vCPU Architecture Fallback (e.g., E16-4as_v5 bills exactly like E16as_v5)
+        if not payg_items:
+            base_sku = re.sub(r'-\d+', '', sku)
+            if base_sku != sku:
+                payg_items = get_payg(base_sku)
+                ri_items = get_ri(base_sku)
 
         def _get_price(items, must_be_win=False):
             cands = []
             for i in items:
                 prod = i.get("productName", "").lower()
                 meter = i.get("meterName", "").lower()
-                is_win_prod = "windows" in prod
-                is_spot_meter = "spot" in meter
                 
+                # Protect against tiny non-standard meters corrupting the math
+                if "low priority" in meter: continue
+                if is_spot and "spot" not in meter: continue
+                if not is_spot and "spot" in meter: continue
+                
+                is_win_prod = "windows" in prod
                 if must_be_win and not is_win_prod: continue
                 if not must_be_win and is_win_prod: continue
-                if is_spot and not is_spot_meter: continue
-                if not is_spot and is_spot_meter: continue
                 
-                cands.append(i)
-                
-            prices = [i["retailPrice"] for i in cands if i.get("retailPrice", 0) > 0]
-            return min(prices) if prices else None
+                if i.get("retailPrice", 0) > 0:
+                    cands.append(i["retailPrice"])
+            return min(cands) if cands else None
 
         linux_hr = _get_price(payg_items, must_be_win=False)
         win_hr   = _get_price(payg_items, must_be_win=True)
@@ -171,20 +193,15 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
             result["windows_license"] = max(0, api_win_tot - api_comp)
 
         if not is_spot:
-            ri_items = fetch(sku, "Reservation")
-            if not ri_items: ri_items = fetch(sku.replace("s_v", "_v").replace("s_V", "_V"), "Reservation")
-            if not ri_items: ri_items = fetch(sku.replace("ds_v", "d_v").replace("ds_V", "d_V"), "Reservation")
-            if not ri_items: ri_items = fetch(sku.replace("ds_v", "s_v").replace("ds_V", "s_V"), "Reservation")
-            
             ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
             ri1_val = _get_price(ri1_cands, must_be_win=False)
-            if ri1_val is not None and api_comp is not None:
-                result["compute_ri1"] = ri1_val / 12 if ri1_val > (api_comp * 3) else ri1_val
+            if ri1_val is not None:
+                result["compute_ri1"] = ri1_val / 12  # Azure RIs are returned as total term upfront
 
             ri3_cands = [i for i in ri_items if i.get("reservationTerm") == "3 Years"]
             ri3_val = _get_price(ri3_cands, must_be_win=False)
-            if ri3_val is not None and api_comp is not None:
-                result["compute_ri3"] = ri3_val / 36 if ri3_val > (api_comp * 10) else ri3_val
+            if ri3_val is not None:
+                result["compute_ri3"] = ri3_val / 36
 
     except Exception as e:
         log.warning(f"VM pricing error for {sku}: {e}")
@@ -193,11 +210,9 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
 
 def extract_vm_sku(desc):
     if not desc: return None
-    # Extracts the SKU name inside the parentheses, e.g., "1 E16-4as v5 ("
     m = re.match(r'^\s*[\d,]+\s+([^()]+)\(', desc)
     if m:
         raw = m.group(1).strip()
-        # We replace spaces with underscores, but PRESERVE hyphens for constrained vCPUs (e.g., E16-4as_v5)
         norm = re.sub(r'\s+', '_', raw)
         if not norm.lower().startswith("standard_"):
             norm = "Standard_" + norm
@@ -230,8 +245,7 @@ def parse_format(wb):
     in_data = valid_format = False
     
     def _get_cost(row_data, idx, fallback):
-        # If the cell exists, is a number, and is strictly greater than 0, use it.
-        # Otherwise (if it's 0, None, or a string), inherit the PAYG cost.
+        # Force missing/zero generic RIs to strictly inherit standard PAYG cost
         if len(row_data) > idx and isinstance(row_data[idx], (int, float)) and row_data[idx] > 0:
             return float(row_data[idx])
         return float(fallback)
@@ -255,7 +269,6 @@ def parse_format(wb):
         rows.append({
             "svc_cat": svc_cat, "svc_type": svc_type, "cust_name": str(r[2] or "").strip(),
             "region": region, "desc": desc, "payg": float(cost_raw),
-            # Extract RI costs, forcing a fallback to PAYG if the Excel value is 0 or invalid
             "ri1": _get_cost(r, 6, cost_raw), 
             "ri3": _get_cost(r, 7, cost_raw), 
             "remarks": "", "sub_rows": []
@@ -363,7 +376,6 @@ def write_vm_sheet(wb, rows):
         p = row.get("api", {})
         if p.get("is_standalone"):
             payg = row.get("payg", 0)
-            # RIs handled by _get_cost fallback in parse_format
             ri1 = row.get("ri1", payg)
             ri3 = row.get("ri3", payg)
             
