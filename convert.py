@@ -156,7 +156,6 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
         payg_items = get_payg(sku)
         ri_items = get_ri(sku)
         
-        # Azure Constrained vCPU Architecture Fallback (e.g., E16-4as_v5 bills exactly like E16as_v5)
         if not payg_items:
             base_sku = re.sub(r'-\d+', '', sku)
             if base_sku != sku:
@@ -169,7 +168,6 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
                 prod = i.get("productName", "").lower()
                 meter = i.get("meterName", "").lower()
                 
-                # Protect against tiny non-standard meters corrupting the math
                 if "low priority" in meter: continue
                 if is_spot and "spot" not in meter: continue
                 if not is_spot and "spot" in meter: continue
@@ -196,7 +194,7 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
             ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
             ri1_val = _get_price(ri1_cands, must_be_win=False)
             if ri1_val is not None:
-                result["compute_ri1"] = ri1_val / 12  # Azure RIs are returned as total term upfront
+                result["compute_ri1"] = ri1_val / 12 
 
             ri3_cands = [i for i in ri_items if i.get("reservationTerm") == "3 Years"]
             ri3_val = _get_price(ri3_cands, must_be_win=False)
@@ -245,7 +243,6 @@ def parse_format(wb):
     in_data = valid_format = False
     
     def _get_cost(row_data, idx, fallback):
-        # Force missing/zero generic RIs to strictly inherit standard PAYG cost
         if len(row_data) > idx and isinstance(row_data[idx], (int, float)) and row_data[idx] > 0:
             return float(row_data[idx])
         return float(fallback)
@@ -327,6 +324,8 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             unaccounted -= win_lic_payg
             
         prem_os_payg = sql_payg = 0
+        
+        # --- THE SURGICAL FIX ---
         if unaccounted > 5:
             if os_type in ["Red Hat", "SUSE"]:
                 prem_os_payg = unaccounted
@@ -334,9 +333,16 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             elif sql_exact:
                 sql_payg = unaccounted
                 unaccounted = 0
+            elif os_type == "Linux":
+                # Safe deduction: If it's labeled Linux but has an unaccounted cost,
+                # it is a Premium OS license (RHEL/SUSE) hidden by the Azure export tool.
+                prem_os_payg = unaccounted
+                row["os_lbl_exact"] = "Premium OS License" 
+                unaccounted = 0
             else:
                 compute_payg += unaccounted 
                 unaccounted = 0
+        # ------------------------
                 
         p["compute_payg_final"] = compute_payg
         p["win_lic_payg_final"] = win_lic_payg
