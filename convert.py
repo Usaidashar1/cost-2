@@ -190,7 +190,6 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
         if api_win_tot and api_comp:
             result["windows_license"] = max(0, api_win_tot - api_comp)
 
-        # Re-enabled API RI Fetching
         if not is_spot:
             ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
             ri1_val = _get_price(ri1_cands, must_be_win=False)
@@ -317,10 +316,12 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
 
         is_spot = "spot" in desc.lower()
         
-        # We fetch USD to act as our absolute source of truth for pricing ratios
+        # We fetch USD to act as our absolute source of truth for pricing ratios and RI costs
         p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
         usd_comp = (p_usd.get("compute_payg") or 0) * qty
         usd_win  = (p_usd.get("windows_license") or 0) * qty
+        usd_ri1  = (p_usd.get("compute_ri1") or 0) * qty
+        usd_ri3  = (p_usd.get("compute_ri3") or 0) * qty
         
         orig_payg = row.get("payg", 0)
         orig_ri1  = row.get("ri1", orig_payg)
@@ -338,17 +339,13 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             }
             return row
 
-        # Fetch Target Currency for accurate native RI costs
+        # Fetch Target Currency for accurate native PAYG fallback comparison
         p_tgt = get_vm_pricing(session, cache, sku, region, is_spot, currency)
         tgt_comp = (p_tgt.get("compute_payg") or 0) * qty
-        tgt_ri1  = (p_tgt.get("compute_ri1") or 0) * qty
-        tgt_ri3  = (p_tgt.get("compute_ri3") or 0) * qty
         
-        # Currency-agnostic check for hidden Premium OS
         has_premium_os = os_type in ["Red Hat", "SUSE"] or (os_type == "Linux" and orig_payg > (tgt_comp * 1.05) and not sql_exact)
         has_sql = bool(sql_exact)
 
-        # Default fallback to Live Exchange Rate
         calc_fx = (tgt_comp / usd_comp) if usd_comp > 0 else 1.0
 
         compute_payg = orig_payg
@@ -358,7 +355,6 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
 
         # --- DEDUCE PAYG COMPONENTS ---
         if not has_sql and not has_premium_os:
-            # PURE VM: Reverse engineer exact locked Excel exchange rate
             usd_total = usd_comp + (usd_win if os_type == "Windows" else 0)
             if usd_total > 0 and orig_payg > 0:
                 calc_fx = orig_payg / usd_total
@@ -368,7 +364,6 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
                 win_lic_payg = usd_win * calc_fx
 
         elif has_premium_os:
-            # PREMIUM OS VM: Safely deduce locked exchange rate
             vcpus = extract_vcpus(desc)
             os_candidates = [42.05, 29.20] if (vcpus and vcpus <= 4) else [94.90, 73.00]
             if not vcpus: os_candidates = [42.05, 94.90, 29.20, 73.00]
@@ -389,29 +384,28 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             row["os_lbl_exact"] = row.get("os_lbl_exact") if os_type != "Linux" else "Premium OS License"
 
         else:
-            # SQL VM: Apply precise live FX to Compute, let drift flow into SQL License
             compute_payg = usd_comp * calc_fx
             if os_type == "Windows":
                 win_lic_payg = usd_win * calc_fx
             unaccounted = orig_payg - compute_payg - win_lic_payg
             sql_payg = max(0, unaccounted)
 
-        # Build final output dictionary
         p = {}
         p["compute_payg_final"] = compute_payg
         p["win_lic_payg_final"] = win_lic_payg
         p["sql_payg_final"]     = sql_payg
         p["prem_os_payg_final"] = prem_os_payg
         
-        # --- HYBRID RI FIX ---
-        # We fetch the exact, natively converted target currency RI cost from Azure API.
-        if tgt_ri1 > 0:
-            p["compute_ri1"] = tgt_ri1
+        # --- THE PROPORTIONAL RI FIX ---
+        # We multiply the stable USD RI value by our precisely deduced Excel exchange rate (calc_fx)
+        # This absolutely guarantees the RI cost aligns perfectly with the Azure Calculator UI.
+        if usd_ri1 > 0:
+            p["compute_ri1"] = usd_ri1 * calc_fx
         else:
             p["compute_ri1"] = max(0, orig_ri1 - (win_lic_payg + prem_os_payg + sql_payg))
             
-        if tgt_ri3 > 0:
-            p["compute_ri3"] = tgt_ri3
+        if usd_ri3 > 0:
+            p["compute_ri3"] = usd_ri3 * calc_fx
         else:
             p["compute_ri3"] = max(0, orig_ri3 - (win_lic_payg + prem_os_payg + sql_payg))
         
