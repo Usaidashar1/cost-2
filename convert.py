@@ -236,6 +236,11 @@ def extract_quantity(desc):
             return 1
     return 1
 
+def extract_vcpus(desc):
+    if not desc: return None
+    m = re.search(r'\((\d+)\s*vCPU', desc, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
 # ── Parsing ────────────────────────────────────────────────────────────────
 def parse_format(wb):
     ws = wb.active
@@ -334,10 +339,40 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
                 sql_payg = unaccounted
                 unaccounted = 0
             elif os_type == "Linux":
-                # Safe deduction: If it's labeled Linux but has an unaccounted cost,
-                # it is a Premium OS license (RHEL/SUSE) hidden by the Azure export tool.
-                prem_os_payg = unaccounted
+                # Premium OS hidden under "Linux" label by Azure Calculator.
+                # Prevent API FX drift from corrupting the OS/Compute split in non-USD currencies.
+                vcpus = extract_vcpus(desc)
+                if vcpus is not None:
+                    os_candidates = [42.05, 29.20] if vcpus <= 4 else [94.90, 73.00]
+                else:
+                    os_candidates = [42.05, 94.90, 29.20, 73.00]
+
+                # Fetch USD compute in background to reverse-engineer Calculator's exact FX rate
+                p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
+                usd_comp = (p_usd.get("compute_payg") or 0) * qty
+                
+                if usd_comp > 0:
+                    api_fx = compute_payg / usd_comp if compute_payg else 1.0
+                    best_os = 42.05
+                    min_diff = float('inf')
+                    
+                    for os_usd in os_candidates:
+                        calc_fx = orig_payg / (usd_comp + (os_usd * qty))
+                        diff = abs(calc_fx - api_fx)
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_os = os_usd
+                            
+                    calc_fx = orig_payg / (usd_comp + (best_os * qty))
+                    exact_os_cost = (best_os * qty) * calc_fx
+                    
+                    prem_os_payg = min(unaccounted, exact_os_cost)
+                else:
+                    prem_os_payg = unaccounted
+                
                 row["os_lbl_exact"] = "Premium OS License" 
+                unaccounted -= prem_os_payg
+                compute_payg += unaccounted  # FX drift flows cleanly back into Compute
                 unaccounted = 0
             else:
                 compute_payg += unaccounted 
