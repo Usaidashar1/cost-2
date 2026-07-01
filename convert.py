@@ -320,63 +320,77 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
         api_comp = (p.get("compute_payg") or 0) * qty
         api_win  = (p.get("windows_license") or 0) * qty
         orig_payg = row.get("payg", 0)
-        compute_payg = api_comp if api_comp > 0 else orig_payg
         
-        unaccounted = orig_payg - compute_payg
-        win_lic_payg = 0
-        if os_type == "Windows" and api_win > 0:
-            win_lic_payg = min(max(0, unaccounted), api_win)
-            unaccounted -= win_lic_payg
-            
-        prem_os_payg = sql_payg = 0
+        # Ensure we always fetch USD prices to bypass API live FX drift
+        p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
+        usd_comp = (p_usd.get("compute_payg") or 0) * qty
+        usd_win  = (p_usd.get("windows_license") or 0) * qty
         
-        # --- THE SURGICAL FIX ---
-        if unaccounted > 5:
-            if os_type in ["Red Hat", "SUSE"]:
-                prem_os_payg = unaccounted
-                unaccounted = 0
-            elif sql_exact:
-                sql_payg = unaccounted
-                unaccounted = 0
-            elif os_type == "Linux":
-                # Premium OS hidden under "Linux" label by Azure Calculator.
-                # Prevent API FX drift from corrupting the OS/Compute split in non-USD currencies.
-                vcpus = extract_vcpus(desc)
-                if vcpus is not None:
-                    os_candidates = [42.05, 29.20] if vcpus <= 4 else [94.90, 73.00]
-                else:
-                    os_candidates = [42.05, 94.90, 29.20, 73.00]
+        has_premium_os = os_type in ["Red Hat", "SUSE"] or (os_type == "Linux" and orig_payg > (usd_comp * 80) and not sql_exact)
+        has_sql = bool(sql_exact)
 
-                # Fetch USD compute in background to reverse-engineer Calculator's exact FX rate
-                p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
-                usd_comp = (p_usd.get("compute_payg") or 0) * qty
-                
-                if usd_comp > 0:
-                    api_fx = compute_payg / usd_comp if compute_payg else 1.0
-                    best_os = 42.05
-                    min_diff = float('inf')
-                    
-                    for os_usd in os_candidates:
-                        calc_fx = orig_payg / (usd_comp + (os_usd * qty))
-                        diff = abs(calc_fx - api_fx)
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_os = os_usd
-                            
-                    calc_fx = orig_payg / (usd_comp + (best_os * qty))
-                    exact_os_cost = (best_os * qty) * calc_fx
-                    
-                    prem_os_payg = min(unaccounted, exact_os_cost)
-                else:
-                    prem_os_payg = unaccounted
-                
-                row["os_lbl_exact"] = "Premium OS License" 
-                unaccounted -= prem_os_payg
-                compute_payg += unaccounted  # FX drift flows cleanly back into Compute
-                unaccounted = 0
+        compute_payg = orig_payg
+        win_lic_payg = 0
+        prem_os_payg = 0
+        sql_payg = 0
+
+        # --- THE SURGICAL FIX (ITERATION 8) ---
+        if not has_sql and not has_premium_os:
+            # PURE VM: Proportional Split to perfectly align with Azure Calculator UI
+            usd_total = usd_comp + (usd_win if os_type == "Windows" else 0)
+            if usd_total > 0 and orig_payg > 0:
+                calc_fx = orig_payg / usd_total
+                compute_payg = usd_comp * calc_fx
+                if os_type == "Windows":
+                    win_lic_payg = usd_win * calc_fx
             else:
-                compute_payg += unaccounted 
-                unaccounted = 0
+                # Safe Fallback
+                compute_payg = api_comp if api_comp > 0 else orig_payg
+                unaccounted = orig_payg - compute_payg
+                if os_type == "Windows":
+                    win_lic_payg = min(max(0, unaccounted), api_win)
+        else:
+            # COMPLEX VM: Absolute deduction 
+            compute_payg = api_comp if api_comp > 0 else orig_payg
+            unaccounted = orig_payg - compute_payg
+            
+            if os_type == "Windows" and api_win > 0:
+                win_lic_payg = min(max(0, unaccounted), api_win)
+                unaccounted -= win_lic_payg
+                
+            if unaccounted > 5:
+                if has_premium_os:
+                    vcpus = extract_vcpus(desc)
+                    os_candidates = [42.05, 29.20] if (vcpus and vcpus <= 4) else [94.90, 73.00]
+                    if not vcpus: os_candidates = [42.05, 94.90, 29.20, 73.00]
+                    
+                    if usd_comp > 0:
+                        api_fx = compute_payg / usd_comp if compute_payg else 1.0
+                        best_os = 42.05
+                        min_diff = float('inf')
+                        
+                        for os_usd in os_candidates:
+                            calc_fx = orig_payg / (usd_comp + (os_usd * qty))
+                            diff = abs(calc_fx - api_fx)
+                            if diff < min_diff:
+                                min_diff = diff
+                                best_os = os_usd
+                                
+                        calc_fx = orig_payg / (usd_comp + (best_os * qty))
+                        exact_os_cost = (best_os * qty) * calc_fx
+                        
+                        prem_os_payg = min(unaccounted, exact_os_cost)
+                    else:
+                        prem_os_payg = unaccounted
+                    
+                    row["os_lbl_exact"] = row.get("os_lbl_exact") if os_type != "Linux" else "Premium OS License"
+                    unaccounted -= prem_os_payg
+                    compute_payg += unaccounted
+                    unaccounted = 0
+                
+                elif sql_exact:
+                    sql_payg = unaccounted
+                    unaccounted = 0
         # ------------------------
                 
         p["compute_payg_final"] = compute_payg
